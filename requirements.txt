@@ -1,3 +1,9 @@
-psycopg2-binary
-python-dotenv
-catboost
+pandas==2.3.3
+numpy==2.3.5
+catboost==1.2.10
+psycopg2-binary==2.9.11
+boto3==1.43.98
+python-dotenv==1.1.0
+scikit-learn==1.9.0
+matplotlib==3.11.0
+seaborn==0.13.2
