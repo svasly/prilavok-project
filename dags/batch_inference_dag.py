@@ -114,8 +114,8 @@ def preprocess_features(**context):
 
     # 2. Читаем временную таблицу
     pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
-    conn = pg_hook.get_conn()
-    df = pg_hook.get_pandas_df("SELECT * FROM inference_data_temp")
+    engine = pg_hook.get_sqlalchemy_engine()
+    df = pd.read_sql("SELECT * FROM inference_data_temp", con=engine)
 
     # 3. Предобработка, идентичная обучению (модуль preprocessing)
     df = preprocess_data(df)
@@ -137,6 +137,7 @@ def preprocess_features(**context):
     logging.info(f"Строк плана, готовых к инференсу: {len(df)}")
 
     # 9. Временная таблица больше не нужна
+    conn = pg_hook.get_conn()
     cursor = conn.cursor()
     cursor.execute("DROP TABLE IF EXISTS inference_data_temp;")
     conn.commit()
