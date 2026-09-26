@@ -115,7 +115,7 @@ def preprocess_features(**context):
     # 2. Читаем временную таблицу
     pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
     conn = pg_hook.get_conn()
-    df = pd.read_sql("SELECT * FROM inference_data_temp", conn)
+    df = pg_hook.get_pandas_df("SELECT * FROM inference_data_temp")
 
     # 3. Предобработка, идентичная обучению (модуль preprocessing)
     df = preprocess_data(df)
@@ -188,7 +188,7 @@ def run_batch_inference(**context):
     model_path = context["ti"].xcom_pull(task_ids="load_model")
 
     # 2. Читаем датафрейм
-    df = pd.read_json(df_json)
+    df = pd.read_json(io.StringIO(df_json))
     df["date"] = pd.to_datetime(df["date"])
 
     # 3. Модель из pickle-файла
@@ -219,7 +219,7 @@ def save_predictions_to_postgres(**context):
     """
     # 1. Датафрейм с предсказаниями из XCom
     predictions_json = context["ti"].xcom_pull(task_ids="run_inference")
-    predictions_df = pd.read_json(predictions_json)
+    predictions_df = pd.read_json(io.StringIO(predictions_json))
 
     # Преобразуем date в правильный формат для PostgreSQL
     predictions_df['date'] = pd.to_datetime(predictions_df['date']).dt.date
