@@ -17,7 +17,7 @@ import logging
 S3_BUCKET = Variable.get("s3_bucket_name", default_var="your-bucket-name")
 S3_ACCESS_KEY = Variable.get("s3_access_key", default_var=None)
 S3_SECRET_KEY = Variable.get("s3_secret_key", default_var=None)
-S3_MODEL_KEY = Variable.get("s3_model_key", default_var="catboost_sales_model.pkl")
+S3_MODEL_KEY = Variable.get("s3_model_key", default_var="catboost_model.pkl")
 POSTGRES_CONN_ID = "postgres_sales_db"  # ID подключения в Airflow Connections
 logger = logging.getLogger(__name__)
 
