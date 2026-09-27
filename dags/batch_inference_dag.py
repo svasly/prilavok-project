@@ -6,17 +6,12 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable
 from airflow.hooks.postgres_hook import PostgresHook
-import pandas as pd
-import numpy as np
-import boto3
-from catboost import CatBoostRegressor
 import logging
-import io
-import pickle
-import tempfile
 
 # ========== Функция предобработки данных ==========
-from preprocessing import preprocess_data, MODEL_FEATURES, ensure_model_dtypes
+# Импорт модуля preprocessing перенесён внутрь задачи preprocess_features:
+# модуль тянет pandas, а scheduler не должен загружать его при каждом разборе dags/
+# (рекомендация ревью про тяжёлые импорты на уровне модуля).
 
 # ========== Конфигурация ==========
 S3_BUCKET = Variable.get("s3_bucket_name", default_var="your-bucket-name")
@@ -24,8 +19,6 @@ S3_ACCESS_KEY = Variable.get("s3_access_key", default_var=None)
 S3_SECRET_KEY = Variable.get("s3_secret_key", default_var=None)
 S3_MODEL_KEY = Variable.get("s3_model_key", default_var="catboost_sales_model.pkl")
 POSTGRES_CONN_ID = "postgres_sales_db"  # ID подключения в Airflow Connections
-RANDOM_STATE = 42
-CAT_FEATURES = ['store', 'dept', 'is_holiday', 'type']
 logger = logging.getLogger(__name__)
 
 
@@ -109,10 +102,14 @@ def preprocess_features(**context):
     8. Передаем датафрейм в XCom (теперь он уже небольшой)
     9. Удалим нашу временную таблицу inference_data_temp из БД
     """
+    import pandas as pd
+    from preprocessing import preprocess_data
+
     # 1. Первая дата плана из XCom
     plan_start = pd.Timestamp(context["ti"].xcom_pull(task_ids="load_data"))
 
-    # 2. Читаем временную таблицу
+    # 2. Читаем временную таблицу через SQLAlchemy-движок: pandas требует
+    #    connectable-объект, иначе UserWarning (в т.ч. внутри hook.get_pandas_df)
     pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
     engine = pg_hook.get_sqlalchemy_engine()
     df = pd.read_sql("SELECT * FROM inference_data_temp", con=engine)
@@ -128,12 +125,16 @@ def preprocess_features(**context):
     if "weekly_sales" in df.columns:
         df = df.drop(columns=["weekly_sales"])
 
-    # 6. Лаги первых недель — нулями (основное заполнение уже в preprocess_data)
+    # 6. Защитное заполнение лагов (основное — в preprocess_data): типичный уровень
+    #    пары, а не ноль: нулевые лаги читались моделью как «отдел перестал продавать»
     lag_cols = ["sales_1week_ago", "sales_2week_ago", "sales_4week_ago"]
-    df[lag_cols] = df[lag_cols].fillna(0)
+    for col in lag_cols:
+        df[col] = df[col].fillna(df["avg_sales_before"])
 
-    # 7. Строки с оставшимися NaN удаляем
+    # 7. Удаляем строки с оставшимися NaN; потеря строк логируется до/после
+    n_before_dropna = len(df)
     df = df.dropna()
+    logging.info(f"Строк до dropna: {n_before_dropna}, после: {len(df)}")
     logging.info(f"Строк плана, готовых к инференсу: {len(df)}")
 
     # 9. Временная таблица больше не нужна
@@ -155,6 +156,10 @@ def load_model_from_s3(**context):
     Сохраните модель во временный файл для передачи через XCom.
     В XCom передайте путь до модели.
     """
+    import io
+    import tempfile
+    import boto3
+
     s3_client = boto3.client(
         "s3",
         endpoint_url="https://storage.yandexcloud.net",
@@ -184,11 +189,17 @@ def run_batch_inference(**context):
     6. Обработайте аномальные предсказания (замените на 0)
     7. Передайте в XCom датафрейм с предсказаниями (используйте .to_json())
     """
+    import io
+    import pickle
+    import pandas as pd
+    from catboost import CatBoostRegressor  # нужен для распаковки pickle модели
+    from preprocessing import MODEL_FEATURES, ensure_model_dtypes
+
     # 1. Данные и путь к модели из XCom
     df_json = context["ti"].xcom_pull(task_ids="preprocess_features")
     model_path = context["ti"].xcom_pull(task_ids="load_model")
 
-    # 2. Читаем датафрейм
+    # 2. Читаем датафрейм (StringIO: передача JSON-строки литералом устарела)
     df = pd.read_json(io.StringIO(df_json))
     df["date"] = pd.to_datetime(df["date"])
 
@@ -218,6 +229,9 @@ def save_predictions_to_postgres(**context):
     2. Подключение к БД, создание таблицы, вставка данных уже реализованы
     3. Выведите через print или logging.info количество строк итоговой таблицы и первые 5 строк.
     """
+    import io
+    import pandas as pd
+
     # 1. Датафрейм с предсказаниями из XCom
     predictions_json = context["ti"].xcom_pull(task_ids="run_inference")
     predictions_df = pd.read_json(io.StringIO(predictions_json))
@@ -262,7 +276,7 @@ def save_predictions_to_postgres(**context):
     execute_values(cursor, insert_query, values)
     conn.commit()
 
-    # 3. Контроль: количество строк и первые 5 строк витрины
+    # Напишите запрос для вывода количества строк полученной таблицы, а также первые ее 5 строк
     cursor.execute("SELECT COUNT(*) FROM predictions;")
     total = cursor.fetchone()[0]
     cursor.execute("SELECT * FROM predictions LIMIT 5;")

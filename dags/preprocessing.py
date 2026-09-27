@@ -8,25 +8,27 @@
 Защитные механизмы:
 - MODEL_FEATURES / FEATURE_DTYPES — контракт состава, порядка и типов столбцов;
 - ensure_model_dtypes() — восстановление типов после JSON-раундтрипа через XCom;
-- заполнение лагов нулями ДО скользящих средних — иначе недели плана с 5-й onward
-  получили бы NaN в скользящих и были бы съедены dropna() в DAG.
+- лаги недель без продаж заполняются типичным уровнем пары (avg_sales_before):
+  нулевые лаги читались моделью как «отдел перестал продавать» (рекомендация ревью);
+- пары без истории получают базовые уровни медианой своего отдела по другим
+  дарксторам: система закупок ждёт прогноз по каждой строке плана (блокер ревью).
 """
 import pandas as pd
 
 # Точный список и ПОРЯДОК признаков, на которых обучена модель (после PSI-фильтра).
-# CatBoost сверяет имена признаков при predict, поэтому состав и порядок критичны.
+# Порядок строго совпадает со столбцами обучения из тетради.
 MODEL_FEATURES = [
     "store", "dept", "is_holiday", "type", "size",
-    "avg_sales_before",
+    "avg_sales_before", "median_sales_before",
     "sales_1week_ago", "sales_2week_ago", "sales_4week_ago",
-    "mean_sales_2week", "mean_sales_4week",
+    "mean_sales_2week", "mean_sales_4week", "mean_sales_8week", "mean_sales_12week",
 ]
 
-# Лаги, включая вспомогательный lag3 для честного 4-недельного окна
-LAG_COLUMNS = ["sales_1week_ago", "sales_2week_ago", "sales_3week_ago", "sales_4week_ago"]
+# Календарные лаги 1–12 недель: в модель входят 1/2/4,
+# остальные нужны только для скользящих окон 4/8/12.
+LAG_COLUMNS = [f"sales_{i}week_ago" for i in range(1, 13)]
 
 # Контракт типов: модель обучена именно на таких dtype.
-# Восстанавливаются перед predict как защита от искажений JSON-раундтрипа через XCom.
 FEATURE_DTYPES = {
     "store": "int64",
     "dept": "int64",
@@ -34,11 +36,14 @@ FEATURE_DTYPES = {
     "type": "str",
     "size": "int64",
     "avg_sales_before": "float64",
+    "median_sales_before": "float64",
     "sales_1week_ago": "float64",
     "sales_2week_ago": "float64",
     "sales_4week_ago": "float64",
     "mean_sales_2week": "float64",
     "mean_sales_4week": "float64",
+    "mean_sales_8week": "float64",
+    "mean_sales_12week": "float64",
 }
 
 
@@ -62,25 +67,25 @@ def create_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def create_avg_sales_feature(df: pd.DataFrame) -> pd.DataFrame:
-    """Средние продажи по (store, dept) строго ДО даты строки: утечка исключена.
+    """Средние и медианные продажи по (store, dept) строго ДО даты строки: утечка исключена.
 
-    expanding().mean() даёт накопительное среднее включая текущую строку,
-    shift(1) сдвигает его на неделю назад. NaN цели (недели плана) при накоплении
-    пропускаются, поэтому для строк плана среднее считается только по истории.
+    expanding().mean()/median() дают накопительную статистику включая текущую строку,
+    shift(1) сдвигает её на неделю назад. NaN цели (недели плана) при накоплении
+    пропускаются, поэтому для строк плана статистики считаются только по истории.
     """
     df = df.sort_values(["store", "dept", "date"]).copy()
-    df["avg_sales_before"] = (
-        df.groupby(["store", "dept"])["weekly_sales"]
-          .transform(lambda s: s.expanding().mean().shift(1))
-    )
+    g = df.groupby(["store", "dept"])["weekly_sales"]
+    df["avg_sales_before"] = g.transform(lambda s: s.expanding().mean().shift(1))
+    # Медиана дополняет среднее: устойчива к выбросам (праздничные пики не перекашивают базовый уровень пары)
+    df["median_sales_before"] = g.transform(lambda s: s.expanding().median().shift(1))
     return df
 
 
 def create_lag_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Лаги 1, 2, 3, 4 недели через календарный сдвиг дат (устойчиво к дырам сетки)."""
+    """Календарные лаги 1–12 недель через сдвиг дат (устойчиво к дырам сетки)."""
     df = df.copy()
     base = df[["store", "dept", "date", "weekly_sales"]]
-    for lag in (1, 2, 3, 4):
+    for lag in range(1, 13):
         lag_df = base.copy()
         lag_df["date"] = lag_df["date"] + pd.DateOffset(weeks=lag)
         lag_df = lag_df.rename(columns={"weekly_sales": f"sales_{lag}week_ago"})
@@ -89,15 +94,17 @@ def create_lag_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def create_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Скользящие средние за 2 и 4 недели из лаговых столбцов.
+    """Скользящие средние за 2, 4, 8 и 12 недель из лаговых столбцов.
 
     Текущая неделя в окно не входит (защита от утечки). Расчёт из лагов, а не из
     weekly_sales, позволяет корректно обработать недели плана: к моменту расчёта
-    лаги уже заполнены нулями там, где продаж ещё не существует.
+    лаги уже заполнены типичным уровнем пары там, где продаж ещё не существует.
     """
     df = df.copy()
-    df["mean_sales_2week"] = df[["sales_1week_ago", "sales_2week_ago"]].mean(axis=1)
-    df["mean_sales_4week"] = df[LAG_COLUMNS].mean(axis=1)
+    df["mean_sales_2week"] = df[LAG_COLUMNS[:2]].mean(axis=1)
+    df["mean_sales_4week"] = df[LAG_COLUMNS[:4]].mean(axis=1)
+    df["mean_sales_8week"] = df[LAG_COLUMNS[:8]].mean(axis=1)    # среднесрочная динамика
+    df["mean_sales_12week"] = df[LAG_COLUMNS[:12]].mean(axis=1)  # квартальная динамика
     return df
 
 
@@ -128,14 +135,22 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns and df[col].isna().any():
             df[col] = df[col].fillna(df[col].mode()[0])
 
-    # 3. Обогащение признаками (порядок важен: лаги -> нули -> скользящие)
+    # 3. Обогащение признаками (порядок важен: базы -> лаги -> заполнение лагов -> скользящие)
     df = create_temporal_features(df)
     df = create_avg_sales_feature(df)
+    # Новые пары без истории: базовые уровни — медиана того же отдела по другим дарксторам
+    for col in ["avg_sales_before", "median_sales_before"]:
+        dept_median = df.groupby("dept")[col].transform("median")
+        df[col] = df[col].fillna(dept_median)
+        df[col] = df[col].fillna(df[col].median())  # страховка: отдел целиком новый
     df = create_lag_features(df)
-    # Недели плана и старт истории: продаж "неделю назад" ещё не существует — 0 по постановке
-    df[LAG_COLUMNS] = df[LAG_COLUMNS].fillna(0)
+    # Недели, для которых продаж N недель назад не существует (план, старт истории):
+    # лаги = типичный уровень пары, а не ноль (рекомендация ревью)
+    for col in LAG_COLUMNS:
+        df[col] = df[col].fillna(df["avg_sales_before"])
     df = create_rolling_features(df)
-    df = df.drop(columns=["sales_3week_ago"])  # вспомогательный лаг, в модель не входит
+    # Оставляем только модельные лаги (1, 2, 4); остальные были вспомогательными
+    df = df.drop(columns=[c for c in LAG_COLUMNS if c not in MODEL_FEATURES])
 
     # 4. Контракт: строго признаки модели + служебная date (нужна DAG для фильтра
     #    строк плана и первичного ключа витрины), типы восстановлены по контракту
